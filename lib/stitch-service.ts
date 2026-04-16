@@ -14,6 +14,7 @@ function applyStitchPatch() {
   try {
     // Extract the Project prototype directly from the exported class.
     // This is safer than creating a dummy object as it avoids accidental transport triggers.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ProjectProto = (Project as any).prototype;
 
     if (ProjectProto && ProjectProto.generate && !ProjectProto.generate.__isPatched) {
@@ -28,7 +29,10 @@ function applyStitchPatch() {
           });
           
           // Find the component that actually contains the 'design' object
-          const designComponent = raw.outputComponents.find((c: any) => c.design && c.design.screens && c.design.screens.length > 0);
+          const designComponent = (raw as { outputComponents: unknown[] }).outputComponents.find((c) => {
+            const component = c as { design?: { screens?: unknown[] } };
+            return component.design && component.design.screens && component.design.screens.length > 0;
+          }) as { design: { screens: { id: string; htmlCode?: { downloadUrl?: string }; screenshot?: { downloadUrl?: string } }[] } } | undefined;
           
           if (!designComponent) {
             throw new Error("No design component found in outputComponents.");
@@ -65,6 +69,7 @@ function applyStitchPatch() {
           };
         } catch (error) {
           // Re-wrap error if the helper exists
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           throw (StitchError as any).fromUnknown ? (StitchError as any).fromUnknown(error) : error;
         }
       };
@@ -268,8 +273,8 @@ class StitchService {
     try {
       // Blind close: always attempt to close the singleton transport to clear state
       // across Next.js HMR reloads and previous job failures.
-      await (stitch as any).close();
-    } catch (err: unknown) {
+      await (stitch as unknown as { close: () => Promise<void> }).close();
+    } catch {
       // Ignore errors related to already-closed connections
     } finally {
       this.isConnected = false;
@@ -905,8 +910,9 @@ class StitchService {
           let project;
           try {
             project = await this.withDeadline(stitch.createProject(projectName), createDeadline);
-          } catch (err: any) {
-            if (err?.message?.includes('Already connected') || err?.message?.includes('Call close()')) {
+          } catch (err: unknown) {
+            const error = err as { message?: string };
+            if (error?.message?.includes('Already connected') || error?.message?.includes('Call close()')) {
               logger.warn('STITCH_TRANSPORT_STALE_HEALING', { jobId });
               await this.disconnect();
               project = await this.withDeadline(stitch.createProject(projectName), createDeadline);
@@ -919,7 +925,7 @@ class StitchService {
           // 3. Wait for INDEXING readiness
           await this.waitForProjectReady(project.id, jobId, workerId, executionId, Date.now() + 30_000, 'INDEX');
 
-          const activeProject = (stitch as any).project(project.id);
+          const activeProject = (stitch as unknown as { project(id: string): StitchProject }).project(project.id);
 
           // 4. Trigger Generation
           let screen: unknown;
@@ -927,7 +933,7 @@ class StitchService {
             try {
               try {
                 await this.withDeadline(activeProject.screens(), Date.now() + 10_000, project.id);
-              } catch (s) { /* non-fatal sanity check */ }
+              } catch { /* non-fatal sanity check */ }
 
               screen = await this.withDeadline(activeProject.generate(enrichedPrompt, "DESKTOP"), Date.now() + 120_000, project.id);
               if (!screen) throw new Error("SDK_GENERATE_RETURNED_NULL");
@@ -941,7 +947,7 @@ class StitchService {
           }
 
           // 5. Retrieve Final HTML
-          const { html, source, depth } = await this.retrieveHtml((screen as any).data || {}, project as any, jobId, screen);
+          const { html, source, depth } = await this.retrieveHtml((screen as { data?: unknown }).data as { htmlCode?: { html?: string; downloadUrl?: string }; html?: string } || {}, project as unknown as { id: string }, jobId, screen);
 
           // Validation
           if (html.length < 500) throw new Error("INVALID_HTML_PAYLOAD_TOO_SHORT");
@@ -957,9 +963,9 @@ class StitchService {
 
           return {
             projectId: project.id,
-            screenId: this.extractScreenId(screen as any),
+            screenId: this.extractScreenId(screen as { id?: string; screenId?: string; name?: string }),
             html,
-            projectState: { projectId: project.id, screenId: this.extractScreenId(screen as any), prompt: cleanPrompt, attempt: retry + 1, traceId: tid },
+            projectState: { projectId: project.id, screenId: this.extractScreenId(screen as { id?: string; screenId?: string; name?: string }), prompt: cleanPrompt, attempt: retry + 1, traceId: tid },
             successfulSource: source,
             fallbackDepth: depth,
             durationMs
