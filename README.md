@@ -1,138 +1,110 @@
-# 🌌 Subdomain SaaS Platform (Next.js 16)
+# 🌌 Stitch AI Multi-Tenant SaaS Platform (Next.js 16)
 
-A premium, production-ready Multi-Tenant SaaS infrastructure built with the latest **Next.js 16.2.1** (App Router). This platform enables dynamic subdomain-based routing, persistent tenant management via SQLite, and high-end styling with Tailwind CSS v4.
+A premium, production-ready Multi-Tenant SaaS infrastructure powered by the **Google Stitch SDK**. This platform enables dynamic subdomain-based routing, automated AI site generation via a robust background worker pipeline, and high-end styling with Tailwind CSS v4.
 
 ---
 
 ## 🚀 Key Features
 
-- **🌐 Dynamic Subdomain Routing**: Seamlessly resolve `*.lvh.me` or your own wildcard production domain to tenant-specific sites.
-- **📊 Unified Dashboard**: Centralized management UI to create, track, and deploy new tenant sites in seconds.
-- **🗄️ Persistence Layer**: Blazing-fast local storage utilizing `better-sqlite3` for tenant metadata and site configurations.
-- **🎨 Premium UX/UI**: Modern, glassmorphic design language implemented via **Tailwind CSS v4** and **Lucide Icons**.
-- **🛠️ Production-Grade Infrastructure**: Ready-to-deploy Nginx configurations with wildcard SSL support and automated deployment scripts.
+- **🤖 AI-Driven Site Generation**: Leverage the **Google Stitch SDK** to generate full-featured tenant sites from text prompts.
+- **🌐 Dynamic Subdomain Routing**: Seamlessly resolve `*.lvh.me` or production wildcard domains to isolated tenant environments.
+- **⚙️ Hardened Generation Pipeline**: Features a "Fast-Healing" transport layer with process-level mutex locks and re-entrancy guards to ensure reliable AI operations.
+- **📊 Unified Dashboard**: Centralized management UI to create, track, and refine tenant sites in real-time.
+- **🗄️ Resilient Persistence**: Blazing-fast local storage utilizing `better-sqlite3` and `Upstash Redis` for job queueing and distributed locking.
+- **🎨 Premium UX/UI**: Modern, glassmorphic design language implemented via **Tailwind CSS v4** and Framer Motion.
 
 ---
 
 ## 🏗️ Architecture Overview
 
-The platform uses a server-side proxy layer to rewrite incoming host-based requests to internal dynamic routes without changing the URL in the browser.
+The platform combines a server-side proxy for routing with an asynchronous worker pipeline for AI heavy-lifting.
 
 ```mermaid
 graph TD
-    A[Visitor: user.lvh.me] --> B[proxy.ts]
+    A[Visitor: tenant.lvh.me] --> B[proxy.ts]
     B -->|Extract Subdomain| C{Host Header}
-    C -->|Rewrite| D[/sites/user/page.tsx]
-    D -->|SSR Fetch| E[(SQLite DB)]
-    E -->|Tenant Data| D
-    D -->|Render| F[Premium Tenant Site]
+    C -->|Internal Rewrite| D[/sites/[tenant]/page.tsx]
+    
+    subgraph AI Pipeline
+    E[Dashboard] -->|Enqueue| F[(Upstash Redis)]
+    F -->|Poll| G[Cron Worker]
+    G -->|Claim Job| H[Stitch Service]
+    H -->|AI Generation| I[@google/stitch-sdk]
+    I -->|HTML Output| J[(SQLite DB)]
+    end
+    
+    J -->|Hydrate| D
 ```
 
 ---
 
 ## 🛠️ Technical Stack
 
-- **Core**: Next.js 16.2.1 (App Router + Turbopack)
-- **Database**: SQLite (`better-sqlite3`)
-- **Styling**: Tailwind CSS v4 (@import syntax)
-- **Icons**: Lucide React
-- **HMR**: Custom `allowedDevOrigins` for secure cross-subdomain hot-reloading.
+- **Framework**: [Next.js 16.2.1](https://nextjs.org/) (App Router + Turbopack)
+- **AI SDK**: [@google/stitch-sdk v0.0.3](https://github.com/google-labs-code/stitch-sdk) (Hardened with custom monkey-patches)
+- **Database**: SQLite (+ `better-sqlite3`)
+- **Queue & Locks**: [Upstash Redis](https://upstash.com/)
+- **Styling**: Tailwind CSS v4
+- **Runtime**: Node.js 20+
 
 ---
 
 ## 🚦 Getting Started
 
 ### 1. Prerequisites
-- Node.js 20+
-- npm / pnpm / yarn
+- Node.js 22+
+- An Upstash Redis account
+- A Google Stitch SDK API Key
 
-### 2. Installation
-```bash
-# Clone and install
-npm install
+### 2. Environment Setup
+Create a `.env.local` file in the root directory:
+
+```env
+# AI SDK
+STITCH_API_KEY=your_stitch_api_key
+
+# Queue (Upstash Redis)
+UPSTASH_REDIS_REST_URL=https://...
+UPSTASH_REDIS_REST_TOKEN=...
+
+# Worker Config
+CRON_SECRET=your_random_secret
 ```
 
-### 3. Execution
+### 3. Installation & Local Development
 ```bash
+# Install dependencies
+npm install
+
 # Start development server
 npm run dev
+
+# Start the background worker (separate terminal)
+./scripts/dev-cron.sh
 ```
 
 ### 4. Local Subdomain Testing
-To test subdomains locally, use the `lvh.me` loopback domain:
+This project uses the `lvh.me` loopback domain to simulate subdomains locally:
 - **Main Dashboard**: [http://localhost:3000/dashboard](http://localhost:3000/dashboard)
-- **Tenant Site**: [http://tenant.lvh.me:3000](http://tenant.lvh.me:3000) (Replace `tenant` with any name created in the dashboard)
+- **Tenant Site**: [http://tenant.lvh.me:3000](http://tenant.lvh.me:3000)
 
 ---
 
-## ⚠️ Critical: Next.js 16/15 Implementation Notes
+## 🛠️ Advanced: Pipeline Hardening
 
-This project adheres to the latest Next.js 16 conventions:
-
-1.  **Async dynamic APIs**: `params` in Layouts and Pages is now a **Promise**. You MUST use `await params` or `React.use(params)`.
-2.  **Internal Proxying**: `middleware.ts` is superseded by `proxy.ts` for advanced host-header based path rewriting.
-3.  **HMR Origins**: Cross-origin requests for HMR are enabled via `allowedDevOrigins` in `next.config.ts` to support port 3000 and 8081.
+The **Stitch AI Pipeline** is reinforced with several enterprise-grade safeguards:
+- **Lazy Monkey-Patching**: Dynamically fixes SDK structural changes without premature transport initialization.
+- **Process Mutex**: Prevents the SDK singleton from being accessed concurrently within the same process.
+- **Fast-Heal Transport**: Automatically detects and repairs stale SDK connections during job execution.
+- **Re-entrancy Guards**: Ensures the cron processor doesn't overlap multiple worker runs.
 
 ---
 
-## 📦 Deployment & DevOps
+## 📦 Deployment
 
-Comprehensive deployment assets are located in the `/deploy` directory:
-
-- [📄 nginx.conf](file:///Users/arsh/Desktop/work/internship/intershipwork/SUBDOMAIN_SAAS_DEMO/deploy/nginx.conf): Wildcard reverse proxy template.
-- [📄 production.md](file:///Users/arsh/Desktop/work/internship/intershipwork/SUBDOMAIN_SAAS_DEMO/deploy/production.md): Step-by-step infrastructure setup (DNS, SSL, PM2).
-- [📄 deploy.sh](file:///Users/arsh/Desktop/work/internship/intershipwork/SUBDOMAIN_SAAS_DEMO/deploy/deploy.sh): automated build and deployment runner.
+Comprehensive deployment assets are located in the `/deploy` directory, including Nginx configurations for wildcard SSL and automated deployment scripts.
 
 ---
 
 ## 📜 License
-MIT © 2026 SUBDOMAIN_SAAS_DEMO
-
-
-
-
-
-1. Wildcard DNS Setup (Do this FIRST)
-You need to configure DNS so that any subdomain points to your server.
-Step-by-step
-Go to your domain provider (where you bought your domain). Common ones:
-* GoDaddy
-* Namecheap
-* Cloudflare
-
-Add these records:
-✅ Record 1 (Wildcard)
-
-Type: A
-Name: *
-Value: YOUR_SERVER_IP
-TTL: Automatic (or 300)
-
-✅ Record 2 (Root domain)
-
-Type: A
-Name: @
-Value: YOUR_SERVER_IP
-TTL: Automatic
-
-
-Example
-If your server IP is 12.34.56.78:
-
-*.domain.com → 12.34.56.78
-domain.com → 12.34.56.78
-
-
-Verify DNS
-Run:
-
-ping test.yourdomain.com
-
-Expected:
-* It resolves to your server IP
-
-⚠️ Common mistakes
-* Using CNAME instead of A → wrong
-* Forgetting * record → subdomains won’t work
-* DNS not propagated yet → wait 5–30 mins (sometimes longer)
-
+MIT © 2026
