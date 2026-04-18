@@ -54,3 +54,5 @@ sdk_out.txt
 node_modules_corrupt_*
 .next/
 node_modules/
+temp_auto_push.bat
+temp_interactive_push.bat

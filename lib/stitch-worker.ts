@@ -200,6 +200,7 @@ export async function processNextJob(): Promise<{ processed: boolean }> {
   let isFailure = false;
   let failStage = 'success';
   let failMessage = '';
+  let result: StitchResult | null = null;
 
   try {
     // 2. HEARTBEAT ACTIVATION (10s Cycle)
@@ -266,7 +267,7 @@ export async function processNextJob(): Promise<{ processed: boolean }> {
           return await stitchService.refine(tenant.stitch_project_id || tenant.name, tenant.stitch_screen_id || '', job.prompt, '', job.id, attemptNumber);
         }
       })(),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('STITCH_WORKER_LIFECYCLE_TIMEOUT')), 300_000))
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('STITCH_WORKER_LIFECYCLE_TIMEOUT')), 600_000))
     ]);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -276,7 +277,7 @@ export async function processNextJob(): Promise<{ processed: boolean }> {
        return { processed: true };
     }
 
-    const result = jobResult as StitchResult;
+    result = jobResult as StitchResult;
 
     if (result.isFallback) {
       isFailure = true;
@@ -463,6 +464,37 @@ export async function processNextJob(): Promise<{ processed: boolean }> {
         job.tenant_id
       );
 
+      // Save all pages to tenant_pages
+      if (result && result.pages && result.pages.length > 0) {
+        // [FIX] Keep the home page in sync with the primary html_content
+        for (const pg of result.pages) {
+          db.prepare(`
+            INSERT OR REPLACE INTO tenant_pages (id, tenant_id, path, html_content, stitch_screen_id, stitch_project_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).run(
+            randomUUID(),
+            job.tenant_id,
+            pg.path,
+            pg.html,
+            pg.screenId,
+            JSON.stringify(pg.projectState)
+          );
+        }
+      } else if (finalHtml) {
+        // Fallback for when only one page is present
+        db.prepare(`
+          INSERT OR REPLACE INTO tenant_pages (id, tenant_id, path, html_content, stitch_screen_id, stitch_project_json)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          randomUUID(),
+          job.tenant_id,
+          '/',
+          finalHtml,
+          storedScreenId,
+          JSON.stringify(storedProjectState)
+        );
+      }
+
       const updatedTenant = db
         .prepare('SELECT version FROM tenants WHERE id = ?')
         .get(job.tenant_id) as { version: number };
@@ -514,7 +546,7 @@ export async function recoverMissingJobs(): Promise<number> { return 0; } // Con
 export async function cleanupStaleJobs(): Promise<number> {
   const stale = db.prepare(`
     SELECT id FROM stitch_jobs
-    WHERE locked_at IS NOT NULL AND locked_at < datetime('now', '-25 minutes') AND status IN ('processing', 'retrying')
+    WHERE locked_at IS NOT NULL AND locked_at < datetime('now', '-6 minutes') AND status IN ('processing', 'retrying')
   `).all() as { id: string }[];
 
   for (const job of stale) {

@@ -106,12 +106,6 @@ export default function Dashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [generatingTenants, setGeneratingTenants] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    fetchTenants();
-    const interval = setInterval(fetchTenants, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
   const fetchTenants = async () => {
     try {
       const res = await fetch('/api/tenants');
@@ -121,6 +115,12 @@ export default function Dashboard() {
       // Silent fail
     }
   };
+
+  useEffect(() => {
+    fetchTenants();
+    const interval = setInterval(fetchTenants, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

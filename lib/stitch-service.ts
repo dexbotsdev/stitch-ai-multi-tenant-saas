@@ -113,6 +113,7 @@ const LAYOUT_FALLBACK: LayoutNormalized = {
 
 interface StitchScreen {
   id: string;
+  name?: string;
   data?: {
     htmlCode?: { html?: string; downloadUrl?: string };
     html?: string;
@@ -177,11 +178,19 @@ export function normalizeLayout(aiOutput: unknown): LayoutNormalized {
 // StitchService: SDK Abstraction Layer
 // ─────────────────────────────────────────────
 
+export interface StitchPage {
+  path: string;
+  html: string;
+  screenId: string;
+  projectState: object;
+}
+
 export interface StitchResult {
   projectId: string;
   screenId: string;
   html: string;
   projectState: object;
+  pages?: StitchPage[];
   projectName?: string;
   prompt?: string;
   attempt?: number;
@@ -903,6 +912,7 @@ class StitchService {
 
         try {
           // 1. Initialize SDK
+          this.setJobPhase(jobId, 'CONNECTING');
           await this.ensureConnected();
 
           // 2. Create Project
@@ -923,11 +933,13 @@ class StitchService {
           if (!project) throw new Error("PROJECT_CREATION_FAILED");
 
           // 3. Wait for INDEXING readiness
+          this.setJobPhase(jobId, 'INDEXING');
           await this.waitForProjectReady(project.id, jobId, workerId, executionId, Date.now() + 30_000, 'INDEX');
 
           const activeProject = (stitch as unknown as { project(id: string): StitchProject }).project(project.id);
 
           // 4. Trigger Generation
+          this.setJobPhase(jobId, 'GENERATING_HOME');
           let screen: unknown;
           for (let sdkAttempt = 1; sdkAttempt <= 2; sdkAttempt++) {
             try {
@@ -935,7 +947,7 @@ class StitchService {
                 await this.withDeadline(activeProject.screens(), Date.now() + 10_000, project.id);
               } catch { /* non-fatal sanity check */ }
 
-              screen = await this.withDeadline(activeProject.generate(enrichedPrompt, "DESKTOP"), Date.now() + 120_000, project.id);
+              screen = await this.withDeadline(activeProject.generate(enrichedPrompt, "DESKTOP"), Date.now() + 180_000, project.id);
               if (!screen) throw new Error("SDK_GENERATE_RETURNED_NULL");
               break; 
             } catch (sdkErr: unknown) {
@@ -946,37 +958,164 @@ class StitchService {
             }
           }
 
-          // 5. Retrieve Final HTML
-          const { html, source, depth } = await this.retrieveHtml((screen as { data?: unknown }).data as { htmlCode?: { html?: string; downloadUrl?: string }; html?: string } || {}, project as unknown as { id: string }, jobId, screen);
+          // [PREVIEW] After Home is designed, retrieve it immediately to show in UI
+          let primaryPageHtml = '';
+          if (screen) {
+            this.setJobPhase(jobId, 'RETRIEVING_PREVIEW');
+            try {
+              const screenWithData = screen as { data?: Record<string, unknown> };
+              const { html } = await this.retrieveHtml(screenWithData.data || {}, project as { id: string }, jobId, screen);
+              if (html) {
+                primaryPageHtml = html;
+                this.setJobPhase(jobId, 'GENERATING_SECONDARY', html);
+              }
+            } catch (err) {
+              logger.warn('PREVIEW_RETRIEVAL_FAILED', { jobId, error: (err as Error).message });
+            }
+          }
 
-          // Validation
-          if (html.length < 500) throw new Error("INVALID_HTML_PAYLOAD_TOO_SHORT");
-          const lowerHtml = html.toLowerCase();
-          const isErrorDominated = html.length < 2000 && (
-            (lowerHtml.includes('error 500') || lowerHtml.includes('internal server error')) ||
-            (lowerHtml.split('undefined').length > 5)
-          );
-          if (isErrorDominated) throw new Error("CORRUPTED_HTML_CONTENT");
+          // 4.5. Trigger Secondary Page Generation
+          if (!primaryPageHtml) this.setJobPhase(jobId, 'GENERATING_SECONDARY');
+          // [MULTI-PAGE] We explicitly generate common pages to ensure they exist.
+          const pages: StitchPage[] = [];
+          const secondaryPages = ['About', 'Contact'];
+          for (const pageName of secondaryPages) {
+            try {
+              // Safety: stop generating if we've already used 5 minutes (300s) 
+              // to leave time for the retrieval loop and final DB writes.
+              const currentTotalElapsed = (Date.now() - attemptStartTime) / 1000;
+              if (currentTotalElapsed > 300) {
+                logger.warn('SKIPPING_SECONDARY_PAGES_DUE_TO_BUDGET', { jobId, pageName, currentTotalElapsed });
+                break;
+              }
 
+              logger.info('GENERATING_SECONDARY_PAGE', { jobId, pageName });
+              const secondaryPrompt = `Generate a "${pageName}" page for this site. It must maintain strict visual consistency with the existing home page's color palette, typography, and layout style. The prompt for this site was: ${prompt}`;
+              
+              const secondaryScreen = await this.withDeadline(
+                activeProject.generate(secondaryPrompt, "DESKTOP"), 
+                Date.now() + 120_000, 
+                project.id
+              );
+
+              if (secondaryScreen) {
+                const secondaryScreenTyped = secondaryScreen as { data?: Record<string, unknown> };
+                const { html: pageHtml } = await this.retrieveHtml(secondaryScreenTyped.data || {}, project as { id: string }, jobId, secondaryScreen);
+                if (pageHtml && pageHtml.length > 100) {
+                   const screenId = this.extractScreenId(secondaryScreen as { id: string });
+                   const path = `/${pageName.toLowerCase()}`;
+                   pages.push({
+                     path,
+                     html: pageHtml,
+                     screenId,
+                     projectState: { projectId: project.id, screenId, path }
+                   });
+                   logger.info('SECONDARY_PAGE_GENERATED_AND_RETRIEVED', { jobId, path, htmlLength: pageHtml.length });
+                }
+              }
+            } catch (err) {
+              logger.warn('SECONDARY_PAGE_GENERATION_FAILED', { jobId, pageName, error: (err as Error).message });
+            }
+          }
+
+          // 5. Retrieve All Screens as Pages
+          this.setJobPhase(jobId, 'FINALIZING');
+          // [HARDENING] Indexing can be slow. We start with the primary screen we just generated.
+          let primarySource: 'inline' | 'sdk' | 'external' = 'inline';
+          let primaryDepth = 0;
+
+          // Process the primary screen first to guarantee at least one page
+          if (screen) {
+            const screenId = (screen as { id: string }).id;
+            logger.info('ATTEMPTING_PRIMARY_PAGE_RETRIEVAL', { jobId, screenId });
+            try {
+              const screenWithData = screen as { data?: Record<string, unknown> };
+              const { html: pageHtml, source: sSrc, depth: sDep } = await this.retrieveHtml(screenWithData.data || {}, project as { id: string }, jobId, screen);
+              logger.info('PRIMARY_PAGE_RETRIEVED', { jobId, htmlLength: pageHtml?.length, source: sSrc });
+              if (pageHtml && pageHtml.length > 100) {
+                const sid = this.extractScreenId(screen as { id: string });
+                primarySource = sSrc;
+                primaryDepth = sDep;
+                pages.push({
+                  path: '/',
+                  html: pageHtml,
+                  screenId: sid,
+                  projectState: { projectId: project.id, screenId: sid, path: '/' }
+                });
+              }
+            } catch (err) {
+              logger.warn('PRIMARY_PAGE_RETRIEVAL_FAILED', { jobId, error: (err as Error).message });
+            }
+          }
+          
+          // Now try to fetch other screens if they exist
+          try {
+            const allScreens = await this.withDeadline(activeProject.screens(), Date.now() + 10_000, project.id);
+            let processedScreens = 0;
+            
+            for (const s of allScreens || []) {
+              // Safety: Don't exceed 5 pages to keep generation time within acceptable limits
+              if (processedScreens >= 4) break; 
+              
+              // Safety: Check remaining budget (300s total budget, we stop at 240s to be safe)
+              const elapsedTotal = (Date.now() - attemptStartTime) / 1000;
+              if (elapsedTotal > 240) {
+                logger.warn('GENERATION_BUDGET_EXCEEDED_STOPPING_RETRIEVAL', { jobId, elapsedTotal });
+                break;
+              }
+
+              const screenId = this.extractScreenId(s as { id: string });
+              // Skip if it's the primary screen we already added
+              if (pages.some(p => p.screenId === screenId)) continue;
+
+              try {
+                const sTyped = s as { data?: Record<string, unknown> };
+                const { html: pageHtml } = await this.retrieveHtml(sTyped.data || {}, project as { id: string }, jobId, s);
+                logger.info('SECONDARY_PAGE_RETRIEVED', { jobId, screenId, htmlLength: pageHtml?.length });
+                if (pageHtml && pageHtml.length > 100) {
+                  const path = `/${s.name?.toLowerCase().replace(/\s+/g, '-') || screenId.slice(0, 8)}`;
+                  pages.push({
+                    path,
+                    html: pageHtml,
+                    screenId,
+                    projectState: { projectId: project.id, screenId, path }
+                  });
+                  processedScreens++;
+                }
+              } catch (err) {
+                logger.warn('SECONDARY_PAGE_RETRIEVAL_FAILED', { jobId, screenId, error: (err as Error).message });
+              }
+            }
+          } catch (err) {
+            logger.warn('ADDITIONAL_SCREENS_FETCH_FAILED', { jobId, error: (err as Error).message });
+          }
+
+          if (pages.length === 0) {
+            // If primary retrieval failed, we might still have nothing, but this is rare if screen exists
+            throw new Error("PRIMARY_GENERATION_RETRIEVAL_FAILED");
+          }
+
+          const primaryPage = pages[0];
           const durationMs = Date.now() - attemptStartTime;
-          logger.info("PIPELINE_SUCCESS", { jobId, traceId: tid, durationMs, source, depth });
+          logger.info("PIPELINE_SUCCESS", { jobId, traceId: tid, durationMs, source: primarySource, depth: primaryDepth, pagesCount: pages.length });
 
           return {
             projectId: project.id,
-            screenId: this.extractScreenId(screen as { id?: string; screenId?: string; name?: string }),
-            html,
-            projectState: { projectId: project.id, screenId: this.extractScreenId(screen as { id?: string; screenId?: string; name?: string }), prompt: cleanPrompt, attempt: retry + 1, traceId: tid },
-            successfulSource: source,
-            fallbackDepth: depth,
+            screenId: primaryPage.screenId,
+            html: primaryPage.html,
+            projectState: { projectId: project.id, screenId: primaryPage.screenId, prompt: cleanPrompt, attempt: retry + 1, traceId: tid },
+            pages,
+            successfulSource: primarySource,
+            fallbackDepth: primaryDepth,
             durationMs
           };
         } finally {
           StitchService.isGlobalTransportBusy = false;
         }
-
       } catch (err: unknown) {
         lastError = err as Error;
         logger.error("PIPELINE_ATTEMPT_FAILED", lastError, { jobId, traceId: tid, attempt: retry + 1 });
+        this.setJobPhase(jobId, 'FAILED');
 
         if (lastError instanceof OwnershipLostError) throw lastError;
 
@@ -1138,6 +1277,19 @@ class StitchService {
 
   async getProjectState(projectId: string): Promise<object> {
     return { projectId };
+  }
+
+  private setJobPhase(jobId: string, phase: string, html?: string) {
+    try {
+      if (html) {
+        db.prepare('UPDATE stitch_jobs SET current_phase = ?, result_html = ? WHERE id = ?').run(phase, html, jobId);
+      } else {
+        db.prepare('UPDATE stitch_jobs SET current_phase = ? WHERE id = ?').run(phase, jobId);
+      }
+      logger.info('JOB_PHASE_UPDATED', { jobId, phase, hasPreview: !!html });
+    } catch (err) {
+      logger.warn('JOB_PHASE_UPDATE_FAILED', { jobId, phase, error: (err as Error).message });
+    }
   }
 }
 

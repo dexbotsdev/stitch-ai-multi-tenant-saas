@@ -2,13 +2,12 @@ import { notFound } from 'next/navigation';
 import db from '@/lib/db';
 import { ArrowRight, Star, Check, Sparkles, Globe } from 'lucide-react';
 import Link from 'next/link';
+import { GenerationStatusTracker } from '@/components/GenerationStatusTracker';
+import { SiteViewWrapper } from '@/components/SiteViewWrapper';
 
 // ─────────────────────────────────────────────
-// Tenant Site Page
-// Renders either:
-// 1. AI-generated HTML (via dangerously... but sandboxed by CSP API route)
-// 2. "Generating" placeholder
-// 3. Default React template
+// Tenant Site Page (Catch-all)
+// Handles multiple pages via [[...slug]]
 // ─────────────────────────────────────────────
 
 export const dynamic = 'force-dynamic';
@@ -17,6 +16,7 @@ export const revalidate = 0;
 interface TenantPageProps {
   params: Promise<{
     tenant: string;
+    slug?: string[];
   }>;
 }
 
@@ -25,9 +25,12 @@ interface TenantRow {
   name: string;
   title: string;
   description: string;
+  generation_status: string;
+}
+
+interface PageRow {
   html_content: string | null;
   stitch_project_json: string | null;
-  generation_status: string;
 }
 
 export async function generateMetadata({ params }: TenantPageProps) {
@@ -44,12 +47,15 @@ export async function generateMetadata({ params }: TenantPageProps) {
 }
 
 export default async function TenantPage({ params }: TenantPageProps) {
-  const { tenant: subdomain } = await params;
+  const { tenant: subdomain, slug } = await params;
   const normalizedName = subdomain.toLowerCase();
+  
+  // Construct path from slug (default to root)
+  const path = slug ? '/' + slug.join('/') : '/';
 
   const tenant = db
     .prepare(
-      'SELECT id, name, title, description, html_content, stitch_project_json, generation_status FROM tenants WHERE name = ?'
+      'SELECT id, name, title, description, generation_status FROM tenants WHERE name = ?'
     )
     .get(normalizedName) as TenantRow | undefined;
 
@@ -57,40 +63,51 @@ export default async function TenantPage({ params }: TenantPageProps) {
     notFound();
   }
 
-  // ── 1. Atomic Rendering Logic (via Secure Renderer API) ──
-  if (tenant.html_content) {
-    const renderUrl = `/api/sites/${encodeURIComponent(tenant.name)}/render`;
+  // ── 1. ACTIVE JOB / DEPLOYMENT GUARD ──
+  // Check if there's an active job for this tenant (site-wide)
+  const activeJob = db
+    .prepare(
+      "SELECT id FROM stitch_jobs WHERE tenant_id = ? AND status IN ('pending', 'processing', 'retrying') ORDER BY created_at DESC LIMIT 1"
+    )
+    .get(tenant.id) as { id: string } | undefined;
+
+  // Fetch specific page content
+  const page = db
+    .prepare('SELECT html_content, stitch_project_json FROM tenant_pages WHERE tenant_id = ? AND path = ?')
+    .get(tenant.id, path) as PageRow | undefined;
+
+  // If a job is active, show the progress tracker (Deployment Guard)
+  // This handles both the initial build AND navigating to missing routes while building.
+  if (activeJob) {
     return (
-      <div className="bg-white fixed inset-0 p-8">
-        <iframe
-          src={renderUrl}
-          title={`${tenant.title || tenant.name} preview`}
-          sandbox="allow-scripts"
-          className="w-full h-full border-0"
+      <div className="min-h-screen bg-white flex items-center justify-center py-20">
+        <GenerationStatusTracker 
+          jobId={activeJob.id} 
+          targetPath={path !== '/' ? path : undefined} 
         />
       </div>
     );
   }
 
-  // ── Generating Placeholder ──
-  if (
-    tenant.generation_status === 'pending' ||
-    tenant.generation_status === 'generating' ||
-    tenant.generation_status === 'retrying'
-  ) {
+  // ── 2. Atomic Rendering Logic (via Secure Renderer API) ──
+  // If we have content for this specific page, render it
+  if (page?.html_content) {
+    const renderUrl = `/api/sites/${encodeURIComponent(tenant.name)}/render?path=${encodeURIComponent(path)}`;
     return (
-      <div className="min-h-screen bg-white flex flex-col items-center justify-center text-center font-sans px-8">
-        <div className="relative mb-8">
-          <div className="w-16 h-16 border-4 border-blue-100 border-t-blue-600 rounded-full animate-spin" />
-          <Sparkles className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-blue-600 w-6 h-6" />
-        </div>
-        <h1 className="text-3xl font-black text-slate-900 mb-2 tracking-tight">Building Your Site</h1>
-        <p className="text-slate-500 text-lg max-w-md">Our AI is currently crafting your unique design. This usually takes less than a minute.</p>
-      </div>
+      <SiteViewWrapper 
+        renderUrl={renderUrl} 
+        tenantName={tenant.title || tenant.name} 
+        initialPath={path} 
+      />
     );
   }
 
-  // ── Fallback: React Template ──
+  // ── 3. Page Not Found (if tenant exists but this path doesn't) ──
+  if (path !== '/') {
+    notFound();
+  }
+
+  // ── 4. Fallback: React Template (Only for root home page) ──
   return (
     <div className="min-h-screen bg-white font-sans selection:bg-blue-100 selection:text-blue-700">
       {/* Navbar */}

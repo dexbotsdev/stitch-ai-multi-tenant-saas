@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import { randomUUID } from 'crypto';
 
 // ─────────────────────────────────────────────
 // Database Initialization
@@ -336,5 +337,58 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_images_tenant ON images(tenant_id, soft_deleted);
   CREATE INDEX IF NOT EXISTS idx_image_usages_image ON image_usages(image_id);
 `);
+
+// ── Table: tenant_pages (Multi-page support) ──
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tenant_pages (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    html_content TEXT,
+    stitch_screen_id TEXT,
+    stitch_project_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(tenant_id, path),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+  )
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_tenant_pages_lookup ON tenant_pages(tenant_id, path)`);
+
+// ─────────────────────────────────────────────
+// ATOMIC MIGRATION: tenant_pages (Move existing home pages)
+// ─────────────────────────────────────────────
+interface MigrationTenant {
+  id: string;
+  html_content: string;
+  stitch_screen_id: string;
+  stitch_project_json: string;
+}
+
+(function migrateExistingHomePages() {
+  try {
+    const existingTenants = db.prepare('SELECT id, html_content, stitch_screen_id, stitch_project_json FROM tenants WHERE html_content IS NOT NULL').all() as MigrationTenant[];
+    
+    db.exec("BEGIN IMMEDIATE TRANSACTION");
+    for (const tenant of existingTenants) {
+      db.prepare(`
+        INSERT OR IGNORE INTO tenant_pages (id, tenant_id, path, html_content, stitch_screen_id, stitch_project_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(),
+        tenant.id,
+        '/',
+        tenant.html_content,
+        tenant.stitch_screen_id,
+        tenant.stitch_project_json
+      );
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch {}
+    console.error('[MIGRATION_ERROR] tenant_pages:', err);
+  }
+})();
 
 export default db;

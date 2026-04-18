@@ -97,8 +97,20 @@ export default function EditorPage() {
   }, [tenantId]);
 
   useEffect(() => {
-    fetchEditorContext();
-    fetchHistory();
+    let mounted = true;
+
+    async function init() {
+      if (mounted) {
+        await fetchEditorContext();
+        await fetchHistory();
+      }
+    }
+
+    init();
+
+    return () => {
+      mounted = false;
+    };
   }, [fetchEditorContext, fetchHistory]);
 
   const pollJobStatus = async (jobId: string) => {

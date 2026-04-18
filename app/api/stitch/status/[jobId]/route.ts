@@ -31,9 +31,9 @@ export async function GET(
     // Query scoped to authenticated user — prevents enumeration
     const job = db
       .prepare(
-        'SELECT id, status, progress, result_html, error, retry_count, max_retries, created_at, started_at FROM stitch_jobs WHERE id = ? AND user_id = ?'
+        'SELECT id, status, progress, result_html, error, retry_count, max_retries, created_at, started_at, current_phase FROM stitch_jobs WHERE id = ? AND user_id = ?'
       )
-      .get(jobId, userId) as JobRow | undefined;
+      .get(jobId, userId) as (JobRow & { current_phase: string }) | undefined;
 
     // Return 404 (not 403) — indistinguishable from "doesn't exist"
     if (!job) {
@@ -45,15 +45,17 @@ export async function GET(
     if (job.status === 'processing' && job.started_at) {
       const elapsed = Date.now() - new Date(job.started_at).getTime();
       // Simulated milestones: 10% at start, ramps to 90% over 30s
-      progress = Math.min(90, 10 + Math.floor((elapsed / 30000) * 80));
+      progress = Math.min(99, 10 + Math.floor((elapsed / 60000) * 89)); // Slower ramp to account for multi-page
     }
 
     const response: Record<string, unknown> = {
       status: job.status,
+      phase: job.current_phase,
       progress,
     };
 
-    if ((job.status === 'success' || job.status === 'fallback') && job.result_html) {
+    // [PREVIEW] If result_html exists, provide it for the miniature preview even if still processing
+    if (job.result_html) {
       response.html = job.result_html;
     }
 

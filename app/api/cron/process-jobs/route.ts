@@ -22,6 +22,7 @@ export async function GET(request: NextRequest) {
   }
 
   if (isProcessing) {
+    // Return early without logging to reduce terminal noise
     return NextResponse.json({ status: 'already-processing', queueLength: await getQueueLength() });
   }
 
